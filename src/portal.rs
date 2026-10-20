@@ -77,6 +77,34 @@ impl Barrier {
     }
 }
 
+/// Size of the enabled outputs' bounding box in logical pixels.
+/// EIS advertises this size at (0, 0); portal coordinates remain in niri space.
+/// This fixes sizing only, not the client's mapping between those spaces.
+fn region_of(zones: &[niri::OutputZone]) -> Option<eis_server::Region> {
+    let mut bounds: Option<(i64, i64, i64, i64)> = None;
+    for output in zones {
+        let z = output.zone;
+        if z.width == 0 || z.height == 0 {
+            continue;
+        }
+        let x = i64::from(z.x);
+        let y = i64::from(z.y);
+        let right = x + i64::from(z.width);
+        let bottom = y + i64::from(z.height);
+        bounds = Some(match bounds {
+            None => (x, y, right, bottom),
+            Some((left, top, r, b)) =>
+                (left.min(x), top.min(y), r.max(right), b.max(bottom)),
+        });
+    }
+    let (left, top, right, bottom) = bounds?;
+    // Reject unrepresentable geometry instead of silently truncating it.
+    Some(eis_server::Region {
+        width: u32::try_from(right - left).ok()?,
+        height: u32::try_from(bottom - top).ok()?,
+    })
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub handle: OwnedObjectPath,
@@ -562,6 +590,17 @@ impl InputCapture {
         app_id: String,
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<zvariant::OwnedFd> {
+        // The region has to be baked into the EIS devices as they are created,
+        // so the layout is read before the handshake can start. That query runs
+        // `niri msg`, so it happens outside the session lock rather than holding
+        // the lock across a subprocess.
+        let outputs = niri::outputs().await.map_err(|err| {
+            zbus::fdo::Error::Failed(format!("cannot enumerate EIS outputs: {err:#}"))
+        })?;
+        let region = Some(region_of(&outputs).ok_or_else(|| {
+            zbus::fdo::Error::Failed("no valid, representable EIS output region".into())
+        })?);
+
         let mut sessions = self.state.sessions.lock().await;
         let Some(session) = sessions.get_mut(&session_handle) else {
             return Err(zbus::fdo::Error::InvalidArgs("unknown session".into()));
@@ -581,6 +620,7 @@ impl InputCapture {
             session_handle.as_str().to_owned(),
             self.state.keymap.clone(),
             self.state.eis_closed.clone(),
+            region,
         )
         .map_err(|e| zbus::fdo::Error::Failed(format!("EIS setup failed: {e:#}")))?;
         session.eis = Some(handle);
@@ -1343,5 +1383,76 @@ mod tests {
         let mut tracker = ClipboardTracker { next_serial: u32::MAX, ..Default::default() };
         let serial = tracker.begin_transfer(a_pipe());
         assert_ne!(serial, 0);
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    fn output(x: i32, y: i32, width: u32, height: u32, scale: f64) -> niri::OutputZone {
+        niri::OutputZone {
+            name: String::new(),
+            zone: niri::Zone { x, y, width, height },
+            scale,
+            transform: "Normal".into(),
+        }
+    }
+
+    fn size(zones: &[niri::OutputZone]) -> Option<(u32, u32)> {
+        region_of(zones).map(|r| (r.width, r.height))
+    }
+
+    #[test]
+    fn negative_horizontal_and_vertical() {
+        assert_eq!(size(&[output(-1920, 0, 1920, 1080, 1.0),
+                          output(0, 0, 1920, 1080, 1.0)]), Some((3840, 1080)));
+        assert_eq!(size(&[output(0, -1080, 1920, 1080, 1.0),
+                          output(0, 0, 1920, 1080, 1.0)]), Some((1920, 2160)));
+    }
+
+    #[test]
+    fn mixed_resolution_scale_and_portrait_logical_sizes() {
+        // 3840x2160 at 2x is already 1920x1080 in niri's logical output.
+        let zones = [output(-1920, 0, 1920, 1080, 2.0),
+                     output(0, -360, 2560, 1440, 1.5),
+                     output(2560, 0, 1080, 1920, 1.0)];
+        assert_eq!(size(&zones), Some((5560, 2280)));
+        let mut reversed = zones.to_vec();
+        reversed.reverse();
+        assert_eq!(size(&zones), size(&reversed));
+    }
+
+    #[test]
+    fn translation_overlap_and_gaps() {
+        assert_eq!(size(&[output(100, 200, 1920, 1080, 1.0)]), Some((1920, 1080)));
+        assert_eq!(size(&[output(-3000, -2000, 1920, 1080, 1.0)]), Some((1920, 1080)));
+        assert_eq!(size(&[output(0, 0, 1920, 1080, 1.0),
+                          output(0, 0, 1920, 1080, 1.0)]), Some((1920, 1080)));
+        assert_eq!(size(&[output(0, 0, 100, 100, 1.0),
+                          output(200, 200, 100, 100, 1.0)]), Some((300, 300)));
+    }
+
+    #[test]
+    fn empty_degenerate_and_overflow() {
+        assert_eq!(size(&[]), None);
+        assert_eq!(size(&[output(0, 0, 0, 1080, 1.0)]), None);
+        assert_eq!(size(&[output(i32::MIN, 0, 0, 1, 1.0),
+                          output(0, 0, 100, 100, 1.0)]), Some((100, 100)));
+        assert_eq!(size(&[output(i32::MIN, 0, 1, 1, 1.0),
+                          output(i32::MAX, 0, 1, 1, 1.0)]), None);
+        assert_eq!(size(&[output(i32::MAX, 0, u32::MAX, 1, 1.0)]), Some((u32::MAX, 1)));
+    }
+
+    #[test]
+    fn recomputation_after_hotplug() {
+        let mut zones = vec![output(0, 0, 1920, 1080, 1.0)];
+        assert_eq!(size(&zones), Some((1920, 1080)));
+        zones.push(output(-2560, 0, 2560, 1440, 1.0));
+        assert_eq!(size(&zones), Some((4480, 1440)));
+        zones.remove(0);
+        assert_eq!(size(&zones), Some((2560, 1440)));
+        zones.clear();
+        assert_eq!(size(&zones), None);
     }
 }
